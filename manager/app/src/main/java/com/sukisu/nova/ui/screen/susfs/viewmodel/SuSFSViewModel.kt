@@ -19,7 +19,9 @@ import com.sukisu.nova.ui.util.getSuSFSVariant
 import com.sukisu.nova.ui.util.getSuSFSImplementation
 import com.sukisu.nova.ui.screen.susfs.repository.SuSFSRepositoryInterface
 import com.sukisu.nova.ui.screen.susfs.repository.SuSFSRepositoryImpl
+import com.sukisu.nova.ui.screen.susfs.util.SuSFSConfig
 import com.sukisu.nova.ui.screen.susfs.util.SuSFSManager
+import com.sukisu.nova.ui.screen.susfs.util.SuSFSRuntimeVerify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -226,13 +228,16 @@ class SuSFSViewModel(
                 "Filter applied, but failed to save the configuration"
             }
             _uiState.update { it.copy(priorityUidFilterResults = listOf(
-                ConfigResult(name, true, ConfigRuntimeStatus.UNVERIFIED)
+                ConfigResult(name, true, verifyMultiKey(
+                    SuSFSConfig.KEY_PRIORITY_UID_FILTER, packages, ","
+                ))
             )) }
             if (SuSFSManager.isAutoStartEnabled()) {
                 val updated = SuSFSManager.configureAutoStart(context, true)
                 _uiState.update { it.copy(priorityUidFilterResults = it.priorityUidFilterResults + ConfigResult(
                     context.getString(R.string.susfs_autostart_title), updated,
-                    if (updated) ConfigRuntimeStatus.UNVERIFIED else ConfigRuntimeStatus.FAILED,
+                    if (updated) verifyBoolKey(SuSFSConfig.KEY_AUTO_START_ENABLED, true)
+                    else ConfigRuntimeStatus.FAILED,
                 )) }
             }
             refreshConfig()
@@ -258,13 +263,16 @@ class SuSFSViewModel(
             } }
             SuSFSManager.saveSusPathUidFilter(packages)
             _uiState.update { it.copy(susPathUidFilterResults = listOf(
-                ConfigResult(name, true, ConfigRuntimeStatus.UNVERIFIED)
+                ConfigResult(name, true, verifyMultiKey(
+                    SuSFSConfig.KEY_SUS_PATH_UID_FILTER, packages, ","
+                ))
             )) }
             if (SuSFSManager.isAutoStartEnabled()) {
                 val updated = SuSFSManager.configureAutoStart(context, true)
                 _uiState.update { it.copy(susPathUidFilterResults = it.susPathUidFilterResults + ConfigResult(
                     context.getString(R.string.susfs_autostart_title), updated,
-                    if (updated) ConfigRuntimeStatus.UNVERIFIED else ConfigRuntimeStatus.FAILED,
+                    if (updated) verifyBoolKey(SuSFSConfig.KEY_AUTO_START_ENABLED, true)
+                    else ConfigRuntimeStatus.FAILED,
                 )) }
             }
             refreshConfig()
@@ -400,15 +408,78 @@ class SuSFSViewModel(
         _uiState.update { it.copy(showResetKstatDialog = show) }
     }
 
+    /**
+     * Verify a boolean config key against what the daemon actually stored.
+     *
+     * Reads the key back through `ksud susfs config get <key>` and compares it to
+     * [expected]. Returns UNVERIFIED only when the read itself failed, so a
+     * successful apply is no longer reported as an error.
+     */
+    internal suspend fun verifyBoolKey(key: String, expected: Boolean): ConfigRuntimeStatus =
+        withContext(Dispatchers.IO) {
+            val stored = try {
+                SuSFSConfig.get(key)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return@withContext ConfigRuntimeStatus.UNVERIFIED
+            }
+            SuSFSRuntimeVerify.toStatus(SuSFSRuntimeVerify.verifyBool(expected, stored))
+        }
+
+    /**
+     * Verify a string config key against what the daemon actually stored.
+     */
+    internal suspend fun verifyStringKey(key: String, expected: String): ConfigRuntimeStatus =
+        withContext(Dispatchers.IO) {
+            val stored = try {
+                SuSFSConfig.get(key)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return@withContext ConfigRuntimeStatus.UNVERIFIED
+            }
+            SuSFSRuntimeVerify.toStatus(SuSFSRuntimeVerify.verifyString(expected, stored))
+        }
+
+    /**
+     * Verify a multi-value config key against what the daemon actually stored.
+     */
+    internal suspend fun verifyMultiKey(
+        key: String,
+        expected: Set<String>,
+        separator: String,
+    ): ConfigRuntimeStatus = withContext(Dispatchers.IO) {
+        val stored = try {
+            SuSFSConfig.get(key)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return@withContext ConfigRuntimeStatus.UNVERIFIED
+        }
+        SuSFSRuntimeVerify.toStatus(SuSFSRuntimeVerify.verifyMulti(expected, stored, separator))
+    }
+
+    /**
+     * Run an apply step, then report its REAL runtime status.
+     *
+     * Previously [status] defaulted to UNVERIFIED and no call site overrode it,
+     * so every apply reported "Runtime state not verified" even though the write
+     * had succeeded. Now the status comes from a read-back: [verify] is only
+     * invoked when the operation returned true, and a read failure yields
+     * UNVERIFIED while a stored-value mismatch yields MISMATCH.
+     */
     private suspend fun report(
         context: Context,
         name: String,
-        status: ConfigRuntimeStatus = ConfigRuntimeStatus.UNVERIFIED,
+        verify: (suspend () -> ConfigRuntimeStatus)? = null,
         operation: suspend () -> Boolean,
     ) {
         val result = try {
-            if (operation()) ConfigResult(name, true, status)
-            else ConfigResult(name, null, ConfigRuntimeStatus.FAILED,
+            if (operation()) {
+                val status = verify?.invoke() ?: ConfigRuntimeStatus.APPLIED
+                ConfigResult(name, true, status)
+            } else ConfigResult(name, null, ConfigRuntimeStatus.FAILED,
                 context.getString(R.string.config_command_rejected))
         } catch (e: CancellationException) {
             throw e
@@ -426,15 +497,29 @@ class SuSFSViewModel(
     fun applyBasicSettings(context: Context) = performOperation {
         beginResults()
         val current = _uiState.value
-        report(context, context.getString(R.string.susfs_tab_basic_settings)) {
+        report(
+            context,
+            context.getString(R.string.susfs_tab_basic_settings),
+            verify = { verifyStringKey(SuSFSConfig.KEY_UNAME_VALUE, current.unameValue.trim()) },
+        ) {
             SuSFSManager.setUname(context, current.unameValue.trim(), current.buildTimeValue.trim())
         }
-        report(context, "post-fs-data") {
+        report(
+            context,
+            "post-fs-data",
+            verify = {
+                verifyBoolKey(SuSFSConfig.KEY_EXECUTE_IN_POST_FS_DATA, current.executeInPostFsData)
+            },
+        ) {
             SuSFSManager.saveExecuteInPostFsData(current.executeInPostFsData)
             true
         }
         if (SuSFSManager.isAutoStartEnabled()) {
-            report(context, context.getString(R.string.susfs_autostart_title)) {
+            report(
+                context,
+                context.getString(R.string.susfs_autostart_title),
+                verify = { verifyBoolKey(SuSFSConfig.KEY_AUTO_START_ENABLED, true) },
+            ) {
                 SuSFSManager.configureAutoStart(context, true)
             }
         }
@@ -501,6 +586,7 @@ class SuSFSViewModel(
         context: Context,
         title: Int,
         command: String,
+        configKey: String,
         enabled: Boolean,
         save: suspend (Boolean) -> Unit,
     ) = performOperation {
@@ -515,12 +601,20 @@ class SuSFSViewModel(
             ))) }
             return@performOperation
         }
-        report(context, context.getString(title)) {
+        report(
+            context,
+            context.getString(title),
+            verify = { verifyBoolKey(configKey, enabled) },
+        ) {
             save(enabled)
             true
         }
         if (SuSFSManager.isAutoStartEnabled()) {
-            report(context, context.getString(R.string.susfs_autostart_title)) {
+            report(
+                context,
+                context.getString(R.string.susfs_autostart_title),
+                verify = { verifyBoolKey(SuSFSConfig.KEY_AUTO_START_ENABLED, true) },
+            ) {
                 SuSFSManager.configureAutoStart(context, true)
             }
         }
@@ -528,19 +622,25 @@ class SuSFSViewModel(
     }
 
     fun setEnableLog(context: Context, enabled: Boolean) = setRuntimeToggle(
-        context, R.string.susfs_enable_log_label, "enable-log", enabled,
+        context, R.string.susfs_enable_log_label, "enable-log",
+        SuSFSConfig.KEY_ENABLE_LOG, enabled,
         SuSFSRepository::saveEnableLogState
     )
 
     private fun saveBootToggle(
         context: Context,
         title: Int,
+        configKey: String,
         enabled: Boolean,
         save: suspend (Boolean) -> Unit,
     ) = performOperation {
         beginResults()
         val autoStart = SuSFSManager.isAutoStartEnabled()
-        report(context, context.getString(title)) {
+        report(
+            context,
+            context.getString(title),
+            verify = { verifyBoolKey(configKey, enabled) },
+        ) {
             save(enabled)
             true
         }
@@ -549,7 +649,7 @@ class SuSFSViewModel(
         _uiState.update { state -> state.copy(operationResults = state.operationResults.map { result ->
             if (!saved) result else result.copy(
                 runtime = if (scheduled) ConfigRuntimeStatus.REBOOT_REQUIRED
-                    else if (autoStart) ConfigRuntimeStatus.FAILED else ConfigRuntimeStatus.UNVERIFIED,
+                    else if (autoStart) ConfigRuntimeStatus.FAILED else ConfigRuntimeStatus.APPLIED,
                 reason = if (!autoStart) context.getString(R.string.config_autostart_required)
                     else if (!scheduled) context.getString(R.string.config_command_rejected) else null
             )
@@ -558,21 +658,25 @@ class SuSFSViewModel(
     }
 
     fun setEnableHideBl(context: Context, enabled: Boolean) = saveBootToggle(
-        context, R.string.hide_bl_script, enabled, SuSFSRepository::saveEnableHideBl
+        context, R.string.hide_bl_script, SuSFSConfig.KEY_ENABLE_HIDE_BL,
+        enabled, SuSFSRepository::saveEnableHideBl
     )
 
     fun setEnableCleanupResidue(context: Context, enabled: Boolean) = saveBootToggle(
-        context, R.string.cleanup_residue, enabled, SuSFSRepository::saveEnableCleanupResidue
+        context, R.string.cleanup_residue, SuSFSConfig.KEY_ENABLE_CLEANUP_RESIDUE,
+        enabled, SuSFSRepository::saveEnableCleanupResidue
     )
 
     fun setEnableAvcLogSpoofing(context: Context, enabled: Boolean) = setRuntimeToggle(
-        context, R.string.avc_log_spoofing, "enable-avc-log-spoofing", enabled,
+        context, R.string.avc_log_spoofing, "enable-avc-log-spoofing",
+        SuSFSConfig.KEY_ENABLE_AVC_LOG_SPOOFING, enabled,
         SuSFSRepository::saveEnableAvcLogSpoofing
     )
 
     fun setHideSusMountsForAllProcs(context: Context, hideForAll: Boolean) = setRuntimeToggle(
         context, R.string.susfs_hide_mounts_for_all_procs_label,
-        "hide-sus-mnts-for-non-su-procs", hideForAll, SuSFSRepository::saveHideSusMountsForAllProcs
+        "hide-sus-mnts-for-non-su-procs", SuSFSConfig.KEY_HIDE_SUS_MOUNTS_FOR_ALL_PROCS,
+        hideForAll, SuSFSRepository::saveHideSusMountsForAllProcs
     )
 
     fun reloadConfig() {
