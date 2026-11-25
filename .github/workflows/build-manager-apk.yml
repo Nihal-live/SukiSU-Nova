@@ -93,12 +93,17 @@ jobs:
           # Versions pinned to what manager/gradle/libs.versions.toml and
           # manager/build.gradle.kts declare: AGP 9.4.1, Gradle 9.7.1,
           # compileSdk 37, build-tools 37.0.0, NDK 29.0.14206865.
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;37.0.0" \
-            "cmake;3.22.1" \
-            "ndk;29.0.14206865"
+          # Show what this runner's SDK repository really offers (names change,
+          # e.g. "android-37" vs "android-37.0"), then install each package on
+          # its own so one missing name does not abort the job. Gradle/AGP
+          # downloads anything still missing once licenses are accepted.
+          sdkmanager --list 2>/dev/null | grep -E "platforms;android-3[6-9]|build-tools;3[6-9]|ndk;29|cmake;3\.22" || true
+          PLAT="$(sdkmanager --list 2>/dev/null | grep -oE 'platforms;android-37[0-9.]*' | sort -V | head -1)"
+          BT="$(sdkmanager --list 2>/dev/null | grep -oE 'build-tools;37[0-9.]*' | grep -vE 'rc|alpha|beta' | sort -V | tail -1)"
+          echo "platform: ${PLAT:-none}  build-tools: ${BT:-none}"
+          for pkg in "platform-tools" "${PLAT:-platforms;android-37}" "${BT:-build-tools;37.0.0}" "cmake;3.22.1" "ndk;29.0.14206865"; do
+            sdkmanager --install "$pkg" || echo "::warning::could not install $pkg with sdkmanager"
+          done
 
       - name: Cache Gradle
         uses: actions/cache@v4
