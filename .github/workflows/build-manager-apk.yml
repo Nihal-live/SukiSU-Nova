@@ -1,0 +1,195 @@
+name: Build SukiSU Nova Manager APK
+
+# Builds a signed, installable manager APK for the SukiSU Nova kernel
+# (com.sukisu.nova) on a stock GitHub-hosted runner.
+#
+# Why this workflow exists: the manager APK cannot be built in a chat sandbox
+# (no Android SDK/NDK, no phone to test on). This runs the real build on
+# GitHub's infrastructure and hands back the APK as a downloadable artifact.
+#
+# v9 adds the SUSFS runtime-verification fix guard. The SUSFS settings screen
+# used to report "Runtime state not verified" on every apply because the status
+# was hardcoded to ConfigRuntimeStatus.UNVERIFIED in SuSFSViewModel.report()
+# and no call site ever overrode it. v9 reads the stored value back through
+# `ksud susfs config get <key>` and reports APPLIED / MISMATCH / UNVERIFIED for
+# real. The guard below fails the job loudly if that fix is missing from the
+# tree, so you never build an APK that still shows the false error.
+#
+# Signing: the APK is signed with a keystore you provide as repository secrets.
+# If you do not provide one, the workflow generates a throwaway keystore so the
+# APK still installs - but then every rebuild has a different signature, and
+# Android will refuse to update over the previous install (uninstall first).
+# For a stable identity, set the four secrets below once.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag or SHA)'
+        required: false
+        default: ''
+      package_name:
+        description: 'Application id (leave default for com.sukisu.nova)'
+        required: false
+        default: 'com.sukisu.nova'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0   # version code/name come from git rev-list and tags
+
+      # ---------------------------------------------------------------
+      # Fail fast if the SUSFS runtime-verification fix is not committed.
+      # Catches the common mistake of building a branch that still has the
+      # hardcoded UNVERIFIED status.
+      # ---------------------------------------------------------------
+      - name: Verify SUSFS runtime-verification fix is present
+        run: |
+          set -eu
+          VM=manager/app/src/main/java/com/sukisu/nova/ui/screen/susfs/viewmodel/SuSFSViewModel.kt
+          RV=manager/app/src/main/java/com/sukisu/nova/ui/screen/susfs/util/SuSFSRuntimeVerify.kt
+          test -f "$RV" || { echo "::error::SuSFSRuntimeVerify.kt is missing - apply patch 0002."; exit 1; }
+          grep -q "fun verifyBoolKey" "$VM" || { echo "::error::verifyBoolKey missing from SuSFSViewModel - apply patch 0002."; exit 1; }
+          grep -q "verify: (suspend () -> ConfigRuntimeStatus)? = null" "$VM" || { echo "::error::report() still has the old hardcoded status parameter - apply patch 0002."; exit 1; }
+          if grep -qE "status: ConfigRuntimeStatus = ConfigRuntimeStatus.UNVERIFIED" "$VM"; then
+            echo "::error::SuSFSViewModel still defaults report() to UNVERIFIED - this is the bug."
+            exit 1
+          fi
+          echo "SUSFS runtime-verification fix present."
+
+      # ---------------------------------------------------------------
+      # Toolchain
+      # ---------------------------------------------------------------
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set -eux
+          # compileSdk 37 / build-tools 37.0.0 as declared in manager/build.gradle.kts
+          # Versions pinned to what manager/gradle/libs.versions.toml and
+          # manager/build.gradle.kts declare: AGP 9.4.1, Gradle 9.7.1,
+          # compileSdk 37, build-tools 37.0.0, NDK 29.0.14206865.
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "cmake;3.22.1" \
+            "ndk;29.0.14206865"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('manager/**/*.gradle*', 'manager/gradle/**', 'manager/gradle/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # ---------------------------------------------------------------
+      # Signing
+      # ---------------------------------------------------------------
+      - name: Prepare keystore
+        working-directory: manager
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -eux
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "Using the keystore from repository secrets."
+            echo "$KEYSTORE_B64" | base64 -d > key.jks
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+            } >> gradle.properties
+          else
+            echo "::warning::No KEYSTORE_B64 secret set - generating a throwaway keystore."
+            echo "::warning::The APK will install, but each rebuild gets a new signature."
+            PASS="$(openssl rand -hex 24)"
+            keytool -genkeypair -v \
+              -keystore key.jks -storetype JKS \
+              -alias manager -keyalg RSA -keysize 4096 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=SukiSU Nova Manager, OU=Self Build, O=Local, C=US"
+            {
+              echo "KEYSTORE_FILE=key.jks"
+              echo "KEYSTORE_PASSWORD=$PASS"
+              echo "KEY_ALIAS=manager"
+              echo "KEY_PASSWORD=$PASS"
+            } >> gradle.properties
+          fi
+
+      # ---------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------
+      - name: Build release APK
+        working-directory: manager
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g"
+            -Dorg.gradle.parallel=true
+            -Dorg.gradle.caching=true
+        run: |
+          set -eux
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace \
+            -Pandroid.injected.signing.store.file="$PWD/key.jks" \
+            assembleRelease
+
+      # ---------------------------------------------------------------
+      # Verify before upload - never ship an unsigned or broken APK
+      # ---------------------------------------------------------------
+      - name: Verify APK
+        working-directory: manager
+        run: |
+          set -eux
+          APK="$(find app/build/outputs/apk/release -name '*.apk' | head -n1)"
+          test -n "$APK"
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+          echo "--- archive integrity ---"
+          unzip -t "$APK" >/dev/null && echo "zip OK"
+
+          echo "--- package / version ---"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n1)"
+          "$AAPT" dump badging "$APK" | grep -E "^package:|^application-label:" || true
+
+          echo "--- signature ---"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n1)"
+          "$APKSIGNER" verify --print-certs "$APK"
+
+          echo "--- size / checksum ---"
+          ls -lh "$APK"
+          sha256sum "$APK" | tee "$APK.sha256"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-nova-manager-apk
+          path: |
+            manager/app/build/outputs/apk/release/*.apk
+            manager/app/build/outputs/apk/release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
